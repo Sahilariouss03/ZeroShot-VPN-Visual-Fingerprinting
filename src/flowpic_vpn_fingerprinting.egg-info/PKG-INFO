@@ -1,0 +1,88 @@
+Metadata-Version: 2.4
+Name: flowpic-vpn-fingerprinting
+Version: 0.1.0
+Summary: FlowPic generation, metric learning, and zero-shot matching for multiplexed VPN traffic.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: numpy>=1.26
+Requires-Dist: pillow>=10.0
+Requires-Dist: scapy>=2.5.0
+Requires-Dist: torch>=2.2
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+
+# FlowPic VPN Fingerprinting MVP
+
+Python project scaffold for Phase 1 of a visual fingerprinting system that turns multiplexed VPN traffic into FlowPic images, learns 128-dimensional embeddings with metric learning, and performs zero-shot template matching.
+
+## Planned workflow
+
+1. Read packets from a PCAP with Scapy.
+2. Slice traffic into fixed-duration windows.
+3. Convert each window into a 2D packet-size vs time histogram.
+4. Train a CNN backbone with triplet margin loss.
+5. Match unknown embeddings against a small library of template embeddings.
+
+## Quick start
+
+Install Python 3.11+ first, then create a virtual environment and install the project:
+
+```powershell
+py -3.11 -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -e .[dev]
+```
+
+Generate a preview FlowPic from a PCAP:
+
+```powershell
+python -m flowpic.generate --pcap path\to\capture.pcap --output outputs\preview.png
+```
+
+Generate a FlowPic from live traffic when you do not have a PCAP yet:
+
+```powershell
+python -m flowpic.capture --output outputs\live_preview.png --duration 15 --filter "tcp or udp"
+```
+
+List the capture interfaces first:
+
+```powershell
+python -m flowpic.capture --list-interfaces
+```
+
+Display the chart interactively as well:
+
+```powershell
+python -m flowpic.generate --pcap path\to\capture.pcap --output outputs\preview.png --show
+```
+
+Live capture with interactive preview:
+
+```powershell
+python -m flowpic.capture --output outputs\live_preview.png --duration 15 --filter "tcp or udp" --show
+```
+
+Capture from a specific interface:
+
+```powershell
+python -m flowpic.capture --list-interfaces
+python -m flowpic.capture --output outputs\live_preview.png --duration 15 --interface "Wi-Fi" --filter "tcp or udp" --show
+```
+
+## Data layout
+
+- Raw captures: `data/raw/<app_name>/`
+- Generated FlowPics: `data/processed/<app_name>/`
+- Manifest rows include label, source PCAP, window start, window end, packet count, and image path.
+
+## Notes
+
+- The generator defaults to 5-second non-overlapping windows.
+- Packet sizes are clipped to `0..1600` bytes.
+- Relative arrival time is the default x-axis; inter-arrival time is also supported.
+- Tunnel traffic is processed from packet headers only; payload decryption is not required.
+- Live capture on Windows usually requires Npcap installed and PowerShell running as Administrator.
+- The live capture command saves both a PNG FlowPic and the captured `.pcap` file so you can reuse the traffic later.

@@ -1,0 +1,8 @@
+matplotlib>=3.8
+numpy>=1.26
+pillow>=10.0
+scapy>=2.5.0
+torch>=2.2
+
+[dev]
+pytest>=8.0

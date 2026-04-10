@@ -1,0 +1,57 @@
+{
+  "assets": {
+    "root": "demo_assets",
+    "train_manifest": "demo_assets\\manifests\\train_manifest.csv",
+    "known_manifest": "demo_assets\\manifests\\known_manifest.csv",
+    "zero_day_manifest": "demo_assets\\manifests\\zero_day_manifest.csv",
+    "known_apps": [
+      "YouTube",
+      "Zoom"
+    ],
+    "zero_day_app": "Signal"
+  },
+  "training": {
+    "checkpoint_path": "demo_assets\\checkpoints\\demo_backbone.pth",
+    "best_loss": 0.0,
+    "epochs": 6,
+    "num_samples": 8,
+    "num_classes": 2,
+    "history": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "known_prediction": {
+    "input": "demo_assets\\images\\YouTube\\youtube_04.png",
+    "label": "YouTube",
+    "distance": 1.2516975402832031e-06,
+    "is_unknown": false,
+    "metric": "cosine",
+    "threshold": 0.08
+  },
+  "zero_day_before_registration": {
+    "input": "demo_assets\\images\\Signal\\signal_00.png",
+    "label": "Unknown",
+    "distance": 0.12985903024673462,
+    "is_unknown": true,
+    "metric": "cosine",
+    "threshold": 0.08
+  },
+  "zero_day_after_registration": {
+    "input": "demo_assets\\images\\Signal\\signal_00.png",
+    "label": "Signal",
+    "distance": 1.1920928955078125e-06,
+    "is_unknown": false,
+    "metric": "cosine",
+    "threshold": 0.08
+  },
+  "demo_claim": {
+    "known_match": true,
+    "zero_day_unknown_before": true,
+    "zero_day_known_after": true
+  }
+}
