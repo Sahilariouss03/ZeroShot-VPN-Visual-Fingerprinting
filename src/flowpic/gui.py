@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -15,7 +16,16 @@ from .generate import generate_flowpic_preview
 from .library import register_application
 from .predict import predict_input
 from .train_pipeline import train_model
+from .live_capture_phase2 import Phase2LivePipeline
 
+
+APP_CATEGORIES = {
+    "youtube": "📺 Video Streaming",
+    "spotify": "🎵 Music / Audio",
+    "gmeet": "📞 Video Conference",
+    "idle_noise": "💤 System Idle",
+    "unknown": "❓ Unknown Traffic"
+}
 
 class FlowPicApp:
     def __init__(self, root: tk.Tk) -> None:
@@ -47,6 +57,9 @@ class FlowPicApp:
         self._build_training_tab()
         self._build_library_tab()
         self._build_demo_tab()
+        self._build_live_inference_tab()
+        
+        self.live_pipeline = None
 
     def _add_labeled_entry(self, parent, row: int, label: str, default: str = "") -> tk.StringVar:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=4)
@@ -233,6 +246,49 @@ class FlowPicApp:
         ttk.Button(frame, text="Create Demo Assets", command=self._create_demo_assets_action).grid(row=4, column=0, padx=6, pady=8, sticky="w")
         ttk.Button(frame, text="Run Full Demo", command=self._run_demo_action).grid(row=4, column=1, padx=6, pady=8, sticky="w")
 
+    def _build_live_inference_tab(self) -> None:
+        frame = ttk.Frame(self.notebook, padding=12)
+        frame.columnconfigure(1, weight=1)
+        self.notebook.add(frame, text="Live Inference (Phase 2)")
+
+        self.live_iface_combo, self.live_capture_interface = self._add_labeled_combobox(frame, 0, "Interface")
+        
+        ttk.Label(frame, text="Capture Preset (BPF)").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        self.live_filter = tk.StringVar(value="ip or ip6")
+        filter_combo = ttk.Combobox(
+            frame, 
+            textvariable=self.live_filter, 
+            width=67,
+            values=[
+                "ip or ip6",
+                "udp port 51820",
+                "udp port 1194 or tcp port 443",
+                "tcp port 443 or udp port 443",
+                "tcp port 443"
+            ]
+        )
+        filter_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+        
+        self.live_checkpoint = self._add_labeled_entry(frame, 2, "Checkpoint", str(Path("checkpoints/backbone_v1.pth")))
+        self.live_library = self._add_labeled_entry(frame, 3, "Library JSON", str(Path("templates/library.json")))
+        self.live_silence = self._add_labeled_entry(frame, 4, "Silence Threshold (Bytes)", "5000")
+        
+        ttk.Button(frame, text="Refresh", command=self._refresh_interfaces).grid(row=0, column=2, padx=6)
+        ttk.Button(frame, text="Browse", command=lambda: self._choose_file(self.live_checkpoint)).grid(row=2, column=2, padx=6)
+        ttk.Button(frame, text="Browse", command=lambda: self._choose_file(self.live_library)).grid(row=3, column=2, padx=6)
+        
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=5, column=1, sticky="w", padx=6, pady=10)
+        self.btn_live_start = ttk.Button(btn_frame, text="Start Live Inference", command=self._start_live_inference)
+        self.btn_live_start.pack(side="left", padx=(0, 6))
+        self.btn_live_stop = ttk.Button(btn_frame, text="Stop Live Inference", command=self._stop_live_inference, state="disabled")
+        self.btn_live_stop.pack(side="left")
+
+        # Results area
+        self.live_results = scrolledtext.ScrolledText(frame, height=12)
+        self.live_results.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=10)
+        frame.rowconfigure(6, weight=1)
+
     def _refresh_interfaces(self) -> None:
         def action():
             interfaces = list_capture_interfaces()
@@ -240,8 +296,10 @@ class FlowPicApp:
             names = list(self.interface_mapping.keys())
             def update_ui():
                 self.interface_combo["values"] = names
+                self.live_iface_combo["values"] = names
                 if names:
                     self.interface_combo.current(0)
+                    self.live_iface_combo.current(0)
             self.root.after(0, update_ui)
             return {"found_interfaces": len(interfaces)}
         self._run_async(action, success_message="Interfaces refreshed.")
@@ -390,6 +448,50 @@ class FlowPicApp:
             return result
 
         self._run_async(action, success_message="Full demo pipeline completed.")
+
+    def _start_live_inference(self) -> None:
+        if self.live_pipeline and self.live_pipeline.running:
+            return
+            
+        iface_name = self.live_capture_interface.get()
+        iface_id = self.interface_mapping.get(iface_name) or iface_name or None
+        
+        def gui_callback(msg_type, *args):
+            if msg_type == "inference":
+                app_name, distance, packet_count = args
+                category = APP_CATEGORIES.get(str(app_name).lower(), f"🌐 {app_name}")
+                msg = f"[{time.strftime('%H:%M:%S')}] {category} | Cosine Dist: {distance:.4f} | Packets: {packet_count}\n"
+            else:
+                text = args[0]
+                msg = f"[{time.strftime('%H:%M:%S')}] {text}\n"
+            self.root.after(0, lambda: [self.live_results.insert("end", msg), self.live_results.see("end")])
+
+        try:
+            silence_val = int(self.live_silence.get() or "5000")
+            
+            self.live_pipeline = Phase2LivePipeline(
+                checkpoint_path=self.live_checkpoint.get(),
+                library_path=self.live_library.get(),
+                interface=iface_id,
+                bpf_filter=self.live_filter.get(),
+                silence_threshold_bytes=silence_val,
+                gui_callback=gui_callback
+            )
+            self.live_pipeline.start()
+            self.btn_live_start.config(state="disabled")
+            self.btn_live_stop.config(state="normal")
+            self.live_results.insert("end", "=== Started Live Inference (5s Window, 2s Stride) ===\n")
+            self._append_log("Started Live Inference Pipeline.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _stop_live_inference(self) -> None:
+        if self.live_pipeline:
+            self.live_pipeline.stop()
+        self.btn_live_start.config(state="normal")
+        self.btn_live_stop.config(state="disabled")
+        self.live_results.insert("end", "=== Stopped Live Inference ===\n")
+        self._append_log("Stopped Live Inference Pipeline.")
 
 
 def main() -> None:
