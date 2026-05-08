@@ -20,11 +20,20 @@ from .live_capture_phase2 import Phase2LivePipeline
 
 
 APP_CATEGORIES = {
-    "youtube": "📺 Video Streaming",
-    "spotify": "🎵 Music / Audio",
-    "gmeet": "📞 Video Conference",
-    "idle_noise": "💤 System Idle",
-    "unknown": "❓ Unknown Traffic"
+    "youtube_4k": "YouTube (4K)",
+    "youtube_720p": "YouTube (HD)",
+    "spotify": "Spotify/Audio",
+    "gmeet_hd": "Google Meet",
+    "idle_noise": "System Idle"
+}
+
+BPF_PRESETS = {
+    "Standard Web (No VPN) [TCP/UDP 443]": "(tcp port 443 or udp port 443)",
+    "IPSec / Disguised [UDP 4500]": "udp port 4500 or udp port 500 or esp",
+    "WireGuard [UDP 51820]": "udp port 51820",
+    "Google Meet (Advanced)": "udp portrange 19302-19309 or udp portrange 10000-20000 or port 443",
+    "All IPv4/IPv6 Traffic (TUN Interface)": "ip or ip6",
+    "Custom BPF Filter...": ""
 }
 
 class FlowPicApp:
@@ -33,6 +42,7 @@ class FlowPicApp:
         self.root.title("FlowPic VPN Fingerprinting")
         self.root.geometry("1100x760")
         self.preview_image: ImageTk.PhotoImage | None = None
+        self.live_buffer = __import__('collections').deque(maxlen=5)
 
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(10, 5))
@@ -105,6 +115,7 @@ class FlowPicApp:
         threading.Thread(target=runner, daemon=True).start()
 
     def _start_progress(self) -> None:
+        self.log.delete("1.0", "end")
         self.progress.start(10)
         self.status_label.configure(text="Processing, please wait...")
         # Disable tabs superficially
@@ -143,7 +154,42 @@ class FlowPicApp:
 
         self.interface_combo, self.capture_interface = self._add_labeled_combobox(live_frame, 0, "Interface")
         self.capture_duration = self._add_labeled_entry(live_frame, 1, "Duration (s)", "15")
-        self.capture_filter = self._add_labeled_entry(live_frame, 2, "Capture Filter", "ip or ip6")
+        
+        ttk.Label(live_frame, text="Capture Filter").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        
+        self.record_filter_friendly = tk.StringVar(value="All IPv4/IPv6 Traffic (TUN Interface)")
+        self.capture_filter = tk.StringVar(value="ip or ip6")
+        
+        self.combo_record_filter = ttk.Combobox(
+            live_frame, 
+            textvariable=self.record_filter_friendly, 
+            width=67,
+            values=list(BPF_PRESETS.keys()),
+            state="readonly"
+        )
+        self.combo_record_filter.grid(row=2, column=1, sticky="ew", padx=6, pady=4)
+        
+        def on_record_preset_change(event):
+            selected = self.record_filter_friendly.get()
+            if selected == "Custom BPF Filter...":
+                self.combo_record_filter.config(state="normal")
+            else:
+                self.combo_record_filter.config(state="readonly")
+                self.capture_filter.set(BPF_PRESETS.get(selected, "ip or ip6"))
+                
+                # Auto-Filename Suffix Logic
+                is_vpn = "WireGuard" in selected or "IPSec" in selected
+                out_png = Path(self.capture_output.get())
+                out_pcap = Path(self.capture_pcap.get())
+                
+                if is_vpn and not out_png.stem.endswith("_vpn"):
+                    self.capture_output.set(str(out_png.with_name(out_png.stem + "_vpn" + out_png.suffix)))
+                    self.capture_pcap.set(str(out_pcap.with_name(out_pcap.stem + "_vpn" + out_pcap.suffix)))
+                elif not is_vpn and out_png.stem.endswith("_vpn"):
+                    self.capture_output.set(str(out_png.with_name(out_png.stem[:-4] + out_png.suffix)))
+                    self.capture_pcap.set(str(out_pcap.with_name(out_pcap.stem[:-4] + out_pcap.suffix)))
+
+        self.combo_record_filter.bind("<<ComboboxSelected>>", on_record_preset_change)
         
         btn_frame = ttk.Frame(live_frame)
         btn_frame.grid(row=3, column=1, sticky="w", padx=6, pady=8)
@@ -253,41 +299,58 @@ class FlowPicApp:
 
         self.live_iface_combo, self.live_capture_interface = self._add_labeled_combobox(frame, 0, "Interface")
         
-        ttk.Label(frame, text="Capture Preset (BPF)").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(frame, text="VPN Protocol / BPF").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        
+        self.live_filter_friendly = tk.StringVar(value="Select a Preset...")
         self.live_filter = tk.StringVar(value="ip or ip6")
+        
         filter_combo = ttk.Combobox(
             frame, 
-            textvariable=self.live_filter, 
+            textvariable=self.live_filter_friendly, 
             width=67,
-            values=[
-                "ip or ip6",
-                "udp port 51820",
-                "udp port 1194 or tcp port 443",
-                "tcp port 443 or udp port 443",
-                "tcp port 443"
-            ]
+            values=list(BPF_PRESETS.keys()),
+            state="readonly"
         )
         filter_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
         
-        self.live_checkpoint = self._add_labeled_entry(frame, 2, "Checkpoint", str(Path("checkpoints/backbone_v1.pth")))
-        self.live_library = self._add_labeled_entry(frame, 3, "Library JSON", str(Path("templates/library.json")))
-        self.live_silence = self._add_labeled_entry(frame, 4, "Silence Threshold (Bytes)", "5000")
+        def on_preset_change(event):
+            self.live_buffer.clear()
+            selected = self.live_filter_friendly.get()
+            if selected == "Custom BPF Filter...":
+                # Allow manual entry if they pick custom
+                filter_combo.config(state="normal")
+            else:
+                filter_combo.config(state="readonly")
+                self.live_filter.set(BPF_PRESETS.get(selected, "ip or ip6"))
+        
+        filter_combo.bind("<<ComboboxSelected>>", on_preset_change)
+        
+        # Add a small hint label for the raw BPF string
+        self.bpf_hint = ttk.Label(frame, textvariable=self.live_filter, font=("Courier", 8), foreground="gray")
+        self.bpf_hint.grid(row=2, column=1, sticky="w", padx=6)
+        
+        self.live_checkpoint = self._add_labeled_entry(frame, 3, "Checkpoint", str(Path("checkpoints/backbone_v1.pth")))
+        self.live_library = self._add_labeled_entry(frame, 4, "Library JSON", str(Path("templates/library.json")))
+        self.live_silence = self._add_labeled_entry(frame, 5, "Silence Threshold (Bytes)", "20000")
         
         ttk.Button(frame, text="Refresh", command=self._refresh_interfaces).grid(row=0, column=2, padx=6)
-        ttk.Button(frame, text="Browse", command=lambda: self._choose_file(self.live_checkpoint)).grid(row=2, column=2, padx=6)
-        ttk.Button(frame, text="Browse", command=lambda: self._choose_file(self.live_library)).grid(row=3, column=2, padx=6)
+        ttk.Button(frame, text="Browse", command=lambda: self._choose_file(self.live_checkpoint)).grid(row=3, column=2, padx=6)
+        ttk.Button(frame, text="Browse", command=lambda: self._choose_file(self.live_library)).grid(row=4, column=2, padx=6)
         
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=5, column=1, sticky="w", padx=6, pady=10)
+        btn_frame.grid(row=6, column=1, sticky="w", padx=6, pady=10)
         self.btn_live_start = ttk.Button(btn_frame, text="Start Live Inference", command=self._start_live_inference)
         self.btn_live_start.pack(side="left", padx=(0, 6))
         self.btn_live_stop = ttk.Button(btn_frame, text="Stop Live Inference", command=self._stop_live_inference, state="disabled")
         self.btn_live_stop.pack(side="left")
 
         # Results area
+        self.live_status_label = ttk.Label(frame, text="Smoothed Result: None", font=("Helvetica", 14, "bold"))
+        self.live_status_label.grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0), padx=6)
+
         self.live_results = scrolledtext.ScrolledText(frame, height=12)
-        self.live_results.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=10)
-        frame.rowconfigure(6, weight=1)
+        self.live_results.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(5, 10))
+        frame.rowconfigure(8, weight=1)
 
     def _refresh_interfaces(self) -> None:
         def action():
@@ -326,12 +389,18 @@ class FlowPicApp:
             iface_name = self.capture_interface.get()
             iface_id = self.interface_mapping.get(iface_name) or iface_name or None
             self._append_log(f"\nStarting live capture on '{iface_name}'...")
+            
+            selected_preset = self.record_filter_friendly.get()
+            final_bpf = BPF_PRESETS.get(selected_preset, selected_preset)
+            if selected_preset == "Custom BPF Filter...":
+                final_bpf = ""
+                
             row, _ = capture_and_generate_flowpic(
                 output_image=self.capture_output.get(),
                 output_pcap=self.capture_pcap.get() or None,
                 duration=int(self.capture_duration.get()),
                 interface=iface_id,
-                bpf_filter=self.capture_filter.get() or None,
+                bpf_filter=final_bpf or None,
                 show=False,
             )
             self._set_preview(row.image_path)
@@ -458,28 +527,82 @@ class FlowPicApp:
         
         def gui_callback(msg_type, *args):
             if msg_type == "inference":
-                app_name, distance, packet_count = args
-                category = APP_CATEGORIES.get(str(app_name).lower(), f"🌐 {app_name}")
-                msg = f"[{time.strftime('%H:%M:%S')}] {category} | Cosine Dist: {distance:.4f} | Packets: {packet_count}\n"
+                app_name, distance, packet_count, confidence = args
+                
+                # Rule 5: Volatility Reset
+                if len(self.live_buffer) >= 1:
+                    last_3 = list(self.live_buffer)[-3:]
+                    avg_packets = sum(item["packet_count"] for item in last_3) / len(last_3)
+                    if avg_packets > 0 and packet_count < (0.3 * avg_packets):
+                        self.live_buffer.clear()
+                
+                # Rule 4: Handle "Heavy Idle" Problem
+                if app_name == "idle_noise" and packet_count > 1000:
+                    app_name = "unknown"
+                    
+                # Rule 6: Generic Streaming becomes Idle/Browsing
+                if "Generic" in app_name:
+                    app_name = "idle_browsing"
+                    
+                self.live_buffer.append({
+                    "app_name": app_name,
+                    "distance": distance,
+                    "packet_count": packet_count,
+                    "confidence": confidence
+                })
             else:
                 text = args[0]
-                msg = f"[{time.strftime('%H:%M:%S')}] {text}\n"
-            self.root.after(0, lambda: [self.live_results.insert("end", msg), self.live_results.see("end")])
+                # Rule 1: Reset on Silence
+                if "Filtering Noise" in text:
+                    self.live_buffer.clear()
+
+            # Default if buffer is cleared by Rule 1
+            smoothed_category = APP_CATEGORIES.get("idle_noise") if not self.live_buffer else "None"
+
+            if self.live_buffer:
+                from collections import Counter
+                labels = [item["app_name"] for item in self.live_buffer]
+                most_common = Counter(labels).most_common(1)
+                best_lbl = most_common[0][0] if most_common else "None"
+                
+                smoothed_category = APP_CATEGORIES.get(str(best_lbl).lower(), f"🌐 {best_lbl}")
+
+            if msg_type == "inference":
+                msg = (
+                    f"[{time.strftime('%H:%M:%S')}] RAW: {self.live_buffer[-1]['app_name']} | "
+                    f"Dist: {args[1]:.4f} | Confidence: {args[3]:.2f} | Packets: {args[2]}\n"
+                )
+            else:
+                msg = f"[{time.strftime('%H:%M:%S')}] {args[0]}\n"
+
+            def update_gui():
+                self.live_status_label.config(text=f"Smoothed Result: {smoothed_category}")
+                self.live_results.insert("end", msg)
+                self.live_results.see("end")
+
+            self.root.after(0, update_gui)
 
         try:
-            silence_val = int(self.live_silence.get() or "5000")
+            silence_val = int(self.live_silence.get() or "50000")
+            
+            # Use the typed text if it's a custom filter, otherwise use the mapped preset
+            selected_preset = self.live_filter_friendly.get()
+            final_bpf = BPF_PRESETS.get(selected_preset, selected_preset)
+            if selected_preset == "Custom BPF Filter...":
+                final_bpf = "" # If they left it as exactly "Custom BPF Filter..."
             
             self.live_pipeline = Phase2LivePipeline(
                 checkpoint_path=self.live_checkpoint.get(),
                 library_path=self.live_library.get(),
                 interface=iface_id,
-                bpf_filter=self.live_filter.get(),
+                bpf_filter=final_bpf,
                 silence_threshold_bytes=silence_val,
                 gui_callback=gui_callback
             )
             self.live_pipeline.start()
             self.btn_live_start.config(state="disabled")
             self.btn_live_stop.config(state="normal")
+            self.live_results.delete("1.0", "end")
             self.live_results.insert("end", "=== Started Live Inference (5s Window, 2s Stride) ===\n")
             self._append_log("Started Live Inference Pipeline.")
         except Exception as e:

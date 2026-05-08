@@ -7,4 +7,9 @@ build/
 *.pyo
 *.png
 *.csv
-
+# Ignore all raw packet captures
+*.pcap
+data/raw/
+data/processed/
+outputs/
+*.png

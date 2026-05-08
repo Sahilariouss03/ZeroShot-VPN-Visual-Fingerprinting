@@ -5,10 +5,10 @@ from collections import deque
 from pathlib import Path
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 from .library import load_model_checkpoint
 from .predict import load_library_tensors
-from .matching import match_embedding
 
 try:
     from scapy.all import sniff
@@ -21,6 +21,12 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 
+DEFAULT_SILENCE_THRESHOLD_BYTES = 20_000
+CONFIDENCE_DELTA = 25.0
+GENERIC_STREAMING_LABEL = "📺 Generic Streaming (Ambiguous Signal)"
+PACKET_COUNT_WEIGHT_REFERENCE = 100
+
+
 class Phase2LivePipeline:
     """
     Phase-2 Pipeline for VPN Identification: Live Packet Capture and FlowPic Inference.
@@ -29,7 +35,7 @@ class Phase2LivePipeline:
     - Multi-threaded: High-speed sniffing + separate processing thread.
     - True sliding window using high-precision time (time_ns).
     - Map IAT and Size to 2D Matrix (32x32 or 64x64).
-    - Pixel Normalization 0-255 based on packet density.
+    - Pixel Normalization 0-255 weighted by total packet count.
     - Live Inference Pipeline (CNN -> 128-d embedding -> Euclidean Distance against Library).
     - Graceful handling of silent periods.
     """
@@ -39,13 +45,15 @@ class Phase2LivePipeline:
         checkpoint_path: str | Path,
         library_path: str | Path,
         interface: str = None,
-        bpf_filter: str = "udp port 51820",
+        bpf_filter: str = "ip or ip6", # Default to all traffic; common VPN ports: 'udp port 51820' (WireGuard), 'tcp port 443' (OpenVPN)
         window_size: float = 5.0,
         stride: float = 2.0,
-        silence_threshold_bytes: int = 1000,
+        silence_threshold_bytes: int = DEFAULT_SILENCE_THRESHOLD_BYTES,
         max_mtu: int = 1600,
         matrix_size: int = 224, # Must match Phase 1 training (224x224)
         threshold: float = 0.35,
+        confidence_delta: float = CONFIDENCE_DELTA,
+        packet_count_weight_reference: int = PACKET_COUNT_WEIGHT_REFERENCE,
         gui_callback=None,
         debug_verbose: bool = True
     ):
@@ -54,9 +62,16 @@ class Phase2LivePipeline:
         self.window_size = window_size
         self.stride = stride
         self.silence_threshold_bytes = silence_threshold_bytes
+        
+        # Dynamic Threshold for Gmeet
+        if self.bpf_filter and ("19302-19309" in self.bpf_filter or "10000-20000" in self.bpf_filter):
+            self.silence_threshold_bytes = 5000
+            
         self.max_mtu = max_mtu
         self.bins = matrix_size
         self.threshold = threshold
+        self.confidence_delta = confidence_delta
+        self.packet_count_weight_reference = max(1, packet_count_weight_reference)
         self.gui_callback = gui_callback
         self.debug_verbose = debug_verbose
         
@@ -154,7 +169,10 @@ class Phase2LivePipeline:
             
             # Transparent Threshold Logic (Inference Fix)
             if total_bytes < self.silence_threshold_bytes:
-                msg = f"[i] Window complete: Only {total_bytes}/{self.silence_threshold_bytes} bytes captured. Skipping inference."
+                msg = (
+                    f"[i] Filtering Noise: {total_bytes}/{self.silence_threshold_bytes} bytes. "
+                    "Signal too weak for reliable classification."
+                )
                 logging.debug(msg)
                 self._report_gui("log", msg)
                 continue
@@ -209,7 +227,7 @@ class Phase2LivePipeline:
         )
         matrix = matrix.astype(np.float32)
         
-        # 3. Log-Contrast & Percentile Normalization (Phase 1 Logic)
+        # 3. Log-Contrast & Percentile Normalization with packet-count weighting.
         matrix = np.log1p(matrix)
         nonzero = matrix[matrix > 0]
         if nonzero.size > 0:
@@ -218,7 +236,9 @@ class Phase2LivePipeline:
                 scale = float(nonzero.max(initial=0.0))
             if scale > 0:
                 matrix = np.clip(matrix / scale, 0.0, 1.0)
-                
+
+        packet_count_weight = min(len(packets) / self.packet_count_weight_reference, 1.0)
+        matrix = np.clip(matrix * packet_count_weight * 255.0, 0.0, 255.0)
         matrix = matrix.T # Shape: (224, 224)
         
         # Matrix "Sanity Check"
@@ -230,26 +250,112 @@ class Phase2LivePipeline:
             
         # 4. Live Inference Pipeline
         # Convert to PyTorch Tensor: shape [1, 1, 224, 224]
-        tensor = torch.tensor(matrix, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
+        tensor = torch.tensor(matrix / 255.0, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             # Pass through CNN to extract 128-d embedding
             embedding = self.model(tensor)
             
-        # 5. Compare using Cosine Distance (Matches Phase 1's 0.35 Threshold)
+        # 5. Compare using Euclidean as the primary magnitude check, while
+        # retaining cosine distance for angular similarity diagnostics.
         if not self.template_library:
-            self._report_gui("inference", "Unknown (No Library)", float('inf'), len(packets))
+            self._report_gui("inference", "Unknown (No Library)", float('inf'), len(packets), 0.0)
             return
-            
-        result = match_embedding(
-            embedding, 
-            self.template_library, 
-            threshold=self.threshold, 
-            metric="cosine"
-        )
+
+        label, min_dist, confidence = self._compare_live_embedding(embedding, len(packets))
         
         # 6. Output Application Name and Confidence Score
-        self._report_gui("inference", result.label, result.distance, len(packets))
+        self._report_gui("inference", label, min_dist, len(packets), confidence)
+
+    def _compare_live_embedding(self, embedding: torch.Tensor, packet_count: int) -> tuple[str, float, float]:
+        """
+        Rank templates with Euclidean distance and guard close matches with a
+        relative confidence delta. Cosine is still computed for dual-distance
+        visibility and to preserve the existing unknown threshold semantics.
+        """
+        unknown = embedding.view(-1).detach()
+        unknown_norm = F.normalize(unknown, p=2, dim=0)
+        scores: list[dict[str, float | str]] = []
+
+        for label, template_embedding in self.template_library.items():
+            template = template_embedding.to(self.device).view(-1)
+            template_norm = F.normalize(template, p=2, dim=0)
+            euclidean_distance = float(torch.norm(unknown - template, p=2).item())
+            
+            # Contextual Weighting for Gmeet
+            if self.bpf_filter and ("19302-19309" in self.bpf_filter or "10000-20000" in self.bpf_filter):
+                if "gmeet" in label.lower():
+                    euclidean_distance *= 0.85
+                    
+            cosine_distance = float(
+                1.0 - F.cosine_similarity(
+                    unknown_norm.unsqueeze(0),
+                    template_norm.unsqueeze(0),
+                ).item()
+            )
+            scores.append(
+                {
+                    "label": label,
+                    "euclidean": euclidean_distance,
+                    "cosine": cosine_distance,
+                }
+            )
+
+        scores.sort(key=lambda item: float(item["euclidean"]))
+        best = scores[0]
+        second = scores[1] if len(scores) > 1 else None
+
+        # Tie-Breaker Logic (15% Euclidean difference)
+        if second:
+            d1_euc = float(best["euclidean"])
+            d2_euc = float(second["euclidean"])
+            denom_euc = max(d2_euc, 1e-12)
+            euc_diff_pct = (d2_euc - d1_euc) / denom_euc
+            
+            if euc_diff_pct < 0.15:
+                # Use Cosine Similarity as decision maker (lower is better distance)
+                if float(second["cosine"]) < float(best["cosine"]):
+                    # Swap them
+                    best, second = second, best
+
+        best_label = str(best["label"])
+        best_distance = float(best["euclidean"])
+        best_cosine = float(best["cosine"])
+
+        confidence = 100.0
+        if second:
+            d1_euc = float(best["euclidean"])
+            d2_euc = float(second["euclidean"])
+            denom = max(d2_euc, 1e-12)
+            delta = abs(d2_euc - d1_euc) / denom
+            confidence = delta * 100.0
+            
+            if delta < (self.confidence_delta / 100.0):
+                best_label = GENERIC_STREAMING_LABEL
+
+        if best_label != GENERIC_STREAMING_LABEL and best_cosine > self.threshold:
+            best_label = "Unknown"
+
+        # Confidence Delta Guardrail for Spotify vs Gmeet
+        if best_label.lower() == "spotify" and packet_count > 1000:
+            gmeet_dist = next((float(s["euclidean"]) for s in scores if "gmeet" in str(s["label"]).lower()), None)
+            if gmeet_dist is not None:
+                denom = max(gmeet_dist, 1e-12)
+                if abs(gmeet_dist - best_distance) / denom < 0.20:
+                    best_label = "Ambiguous (Likely Video Call)"
+
+        if self.debug_verbose:
+            second = scores[1] if len(scores) > 1 else None
+            logging.debug(
+                "Live distance ranking: best=%s l2=%.4f cosine=%.4f second=%s confidence=%.2f",
+                best["label"],
+                best_distance,
+                best_cosine,
+                second["label"] if second else "n/a",
+                confidence,
+            )
+
+        return best_label, best_distance, confidence
 
     def _report_gui(self, msg_type: str, *args):
         # Pass to GUI if callback exists using non-blocking architecture
@@ -257,8 +363,11 @@ class Phase2LivePipeline:
             self.gui_callback(msg_type, *args)
             
         if msg_type == "inference":
-            app_name, distance, packet_count = args
-            msg = f"[LIVE INFERENCE] App: {app_name} | Distance: {distance:.4f} | Window Packets: {packet_count}"
+            app_name, distance, packet_count, confidence = args
+            msg = (
+                f"[LIVE INFERENCE] DETECTED: {app_name} | Dist: {distance:.4f} | "
+                f"Confidence: {confidence:.2f} | Window Packets: {packet_count}"
+            )
             logging.info(msg)
             print(msg)
 
@@ -298,6 +407,18 @@ if __name__ == "__main__":
     parser.add_argument("--library", default="templates/library.json", help="Path to reference library")
     parser.add_argument("--filter", default="", help="BPF Filter e.g. 'udp port 51820'")
     parser.add_argument("--interface", default=None, help="Capture interface")
+    parser.add_argument(
+        "--silence-threshold-bytes",
+        type=int,
+        default=DEFAULT_SILENCE_THRESHOLD_BYTES,
+        help="Minimum bytes in a window before live inference is attempted.",
+    )
+    parser.add_argument(
+        "--confidence-delta",
+        type=float,
+        default=CONFIDENCE_DELTA,
+        help="Minimum percent gap between the top two Euclidean matches before reporting a specific app.",
+    )
     args = parser.parse_args()
     
     pipeline = Phase2LivePipeline(
@@ -305,6 +426,8 @@ if __name__ == "__main__":
         library_path=args.library,
         bpf_filter=args.filter,
         interface=args.interface,
+        silence_threshold_bytes=args.silence_threshold_bytes,
+        confidence_delta=args.confidence_delta,
         window_size=60.0,
         stride=15.0,
         matrix_size=32 # 32x32 FlowPic
